@@ -51,7 +51,6 @@ else:
 from .exceptions import BufferFull, ExtraData, FormatError, OutOfData, StackError
 from .ext import ExtType, Timestamp
 
-EX_SKIP = 0
 EX_CONSTRUCT = 1
 EX_READ_ARRAY_HEADER = 2
 EX_READ_MAP_HEADER = 3
@@ -515,11 +514,6 @@ class Unpacker:
             return n
         # TODO should we eliminate the recursion?
         if typ == TYPE_ARRAY:
-            if execute == EX_SKIP:
-                for i in range(n):
-                    # TODO check whether we need to call `list_hook`
-                    self._unpack(EX_SKIP)
-                return
             ret = newlist_hint(min(n, 10000))
             for i in range(n):
                 ret.append(self._unpack(EX_CONSTRUCT))
@@ -528,12 +522,6 @@ class Unpacker:
             # TODO is the interaction between `list_hook` and `use_list` ok?
             return ret if self._use_list else tuple(ret)
         if typ == TYPE_MAP:
-            if execute == EX_SKIP:
-                for i in range(n):
-                    # TODO check whether we need to call hooks
-                    self._unpack(EX_SKIP)
-                    self._unpack(EX_SKIP)
-                return
             if self._object_pairs_hook is not None:
                 # Pass a list, as the C extension does, so the whole map is
                 # consumed even if the hook does not iterate it.
@@ -556,8 +544,6 @@ class Unpacker:
                 if self._object_hook is not None:
                     ret = self._object_hook(ret)
             return ret
-        if execute == EX_SKIP:
-            return
         if typ == TYPE_RAW:
             if self._raw:
                 obj = bytes(obj)
@@ -598,11 +584,62 @@ class Unpacker:
 
     next = __next__
 
+    def _skip(self):
+        # Strict, iterative skip.  Every header goes through _read_header(),
+        # so length limits (max_str_len/max_bin_len/max_array_len/max_map_len/
+        # max_ext_len) and format checks are identical to normal unpacking.
+        # Containers are tracked with a bounded explicit stack instead of
+        # recursion, and no Python objects are constructed: ext payloads stay
+        # opaque and ext_hook, object_hook, object_pairs_hook and list_hook
+        # are never called.
+        #
+        # Each stack frame is [remaining_items, is_map, expect_key]; for maps
+        # remaining_items counts keys and values together.
+        stack = []
+        while True:
+            expect_key = bool(stack) and stack[-1][1] and stack[-1][2]
+            typ, n, obj = self._read_header()
+
+            if expect_key and self._strict_map_key and typ != TYPE_RAW and typ != TYPE_BIN:
+                raise ValueError("map key must be str or bytes while skipping")
+
+            if typ == TYPE_RAW and not self._raw:
+                # Enforce the same UTF-8 constraints as normal unpacking.
+                obj.decode("utf_8", self._unicode_errors)
+
+            if (typ == TYPE_ARRAY or typ == TYPE_MAP) and n > 0:
+                if len(stack) >= DEFAULT_RECURSE_LIMIT:
+                    # Reject before descending into the container.
+                    raise StackError("exceeds max nesting depth while skipping")
+                is_map = typ == TYPE_MAP
+                stack.append([2 * n if is_map else n, is_map, is_map])
+                continue
+
+            # The item just finished (scalar or empty container); consume one
+            # slot of its parent and wind up any ancestors it completes.
+            while True:
+                if not stack:
+                    return
+                frame = stack[-1]
+                frame[0] -= 1
+                if frame[1]:
+                    frame[2] = not frame[2]
+                if frame[0] > 0:
+                    break
+                stack.pop()
+
     def skip(self):
-        try:
-            self._unpack(EX_SKIP)
-        except RecursionError:
-            raise StackError
+        """Read and discard the next object.
+
+        The object is validated with the same rules as :meth:`unpack`
+        (format, length limits, nesting depth, strict map keys and UTF-8
+        correctness), but nothing is constructed and no hooks are called.
+        When used after :meth:`read_array_header` or :meth:`read_map_header`,
+        each call skips a single element (or key/value) of the container
+        being read; limits apply cumulatively to every header read, and
+        :meth:`tell` counts all consumed bytes, skipped ones included.
+        """
+        self._skip()
         self._consume()
 
     def unpack(self):
@@ -614,16 +651,31 @@ class Unpacker:
         return ret
 
     def read_array_header(self):
+        """Read the header of a msgpack array and return its size.
+
+        The caller is expected to read the returned number of elements
+        itself, with :meth:`unpack` and/or :meth:`skip`.  Length limits
+        checked here count toward the same cumulative limits as any other
+        read, and :meth:`tell` includes the consumed header bytes.
+        """
         ret = self._unpack(EX_READ_ARRAY_HEADER)
         self._consume()
         return ret
 
     def read_map_header(self):
+        """Read the header of a msgpack map and return its size.
+
+        The caller is expected to read the returned number of key/value
+        pairs itself, with :meth:`unpack` and/or :meth:`skip`.  Length
+        limits checked here count toward the same cumulative limits as any
+        other read, and :meth:`tell` includes the consumed header bytes.
+        """
         ret = self._unpack(EX_READ_MAP_HEADER)
         self._consume()
         return ret
 
     def tell(self):
+        """Return the number of bytes consumed so far, including skipped ones."""
         return self._stream_offset
 
 
