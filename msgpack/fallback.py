@@ -65,6 +65,32 @@ TYPE_EXT = 5
 
 DEFAULT_RECURSE_LIMIT = 1024
 
+# Decisions an ext_policy callback may return.
+EXT_ALLOW = "allow"
+EXT_KEEP = "keep"
+EXT_REJECT = "reject"
+
+
+class _MapKeyMarker:
+    def __repr__(self):
+        return "MAP_KEY"
+
+
+#: Path component used when an extension appears in map key position.
+MAP_KEY = _MapKeyMarker()
+
+
+def _format_ext_path(path):
+    parts = ["$"]
+    for comp in path:
+        if comp is MAP_KEY:
+            parts.append("[<map key>]")
+        elif isinstance(comp, int):
+            parts.append("[%d]" % comp)
+        else:
+            parts.append(".%s" % (comp,))
+    return "".join(parts)
+
 
 def _check_type_strict(obj, t, type=type, tuple=tuple):
     if type(t) is tuple:
@@ -184,6 +210,25 @@ class Unpacker:
         This option should be used only when you have msgpack data which
         contains invalid UTF-8 string.
 
+    :param ext_policy:
+        When specified, it should be callable.  It is called as
+        ``ext_policy(code, data_len, path)`` before any extension (including
+        the built-in timestamp type) is passed to `ext_hook` or the timestamp
+        decoder, and must return one of:
+
+            ``EXT_ALLOW`` - decode the extension normally (default behavior).
+            ``EXT_KEEP``  - return ``ExtType(code, data)`` without decoding.
+            ``EXT_REJECT`` - raise ``ValueError``.
+
+        *code* is the extension type code (-1 for timestamp), *data_len* is
+        the raw payload length, and *path* is a tuple locating the extension
+        in the structure: map values are represented by their raw (undecoded
+        by hooks) key, array elements by their integer index, and map keys by
+        the ``MAP_KEY`` marker.  The policy is consulted before the key is
+        validated against *strict_map_key*, so extensions in key position can
+        be rejected before `ext_hook` runs.  The path state is local to this
+        Unpacker instance.
+
     :param int max_buffer_size:
         Limits size of data waiting unpacked.  0 means 2**32-1.
         The default value is 100*1024*1024 (100MiB).
@@ -247,6 +292,7 @@ class Unpacker:
         object_pairs_hook=None,
         list_hook=None,
         unicode_errors=None,
+        ext_policy=None,
         max_buffer_size=100 * 1024 * 1024,
         ext_hook=ExtType,
         max_str_len=-1,
@@ -308,6 +354,8 @@ class Unpacker:
         self._object_hook = object_hook
         self._object_pairs_hook = object_pairs_hook
         self._ext_hook = ext_hook
+        self._ext_policy = ext_policy
+        self._ext_path = []
         self._max_str_len = max_str_len
         self._max_bin_len = max_bin_len
         self._max_array_len = max_array_len
@@ -325,6 +373,8 @@ class Unpacker:
             raise TypeError("object_pairs_hook and object_hook are mutually exclusive")
         if not callable(ext_hook):
             raise TypeError("`ext_hook` is not callable")
+        if ext_policy is not None and not callable(ext_policy):
+            raise TypeError("`ext_policy` is not callable")
 
     def feed(self, next_bytes):
         assert self._feeding
@@ -521,8 +571,15 @@ class Unpacker:
                     self._unpack(EX_SKIP)
                 return
             ret = newlist_hint(min(n, 10000))
+            track_path = self._ext_policy is not None
             for i in range(n):
-                ret.append(self._unpack(EX_CONSTRUCT))
+                if track_path:
+                    self._ext_path.append(i)
+                try:
+                    ret.append(self._unpack(EX_CONSTRUCT))
+                finally:
+                    if track_path:
+                        self._ext_path.pop()
             if self._list_hook is not None:
                 ret = self._list_hook(ret)
             # TODO is the interaction between `list_hook` and `use_list` ok?
@@ -539,20 +596,16 @@ class Unpacker:
                 # consumed even if the hook does not iterate it.
                 pairs = []
                 for _ in range(n):
-                    key = self._unpack(EX_CONSTRUCT)
-                    if self._strict_map_key and type(key) not in (str, bytes):
-                        raise ValueError("%s is not allowed for map key" % str(type(key)))
-                    pairs.append((key, self._unpack(EX_CONSTRUCT)))
+                    key = self._unpack_map_key()
+                    pairs.append((key, self._unpack_map_value(key)))
                 ret = self._object_pairs_hook(pairs)
             else:
                 ret = {}
                 for _ in range(n):
-                    key = self._unpack(EX_CONSTRUCT)
-                    if self._strict_map_key and type(key) not in (str, bytes):
-                        raise ValueError("%s is not allowed for map key" % str(type(key)))
+                    key = self._unpack_map_key()
                     if isinstance(key, str):
                         key = sys.intern(key)
-                    ret[key] = self._unpack(EX_CONSTRUCT)
+                    ret[key] = self._unpack_map_value(key)
                 if self._object_hook is not None:
                     ret = self._object_hook(ret)
             return ret
@@ -567,6 +620,17 @@ class Unpacker:
         if typ == TYPE_BIN:
             return bytes(obj)
         if typ == TYPE_EXT:
+            if self._ext_policy is not None:
+                decision = self._ext_policy(n, len(obj), tuple(self._ext_path))
+                if decision == EXT_REJECT:
+                    raise ValueError(
+                        "ext type %d rejected by ext_policy at %s"
+                        % (n, _format_ext_path(self._ext_path))
+                    )
+                if decision == EXT_KEEP:
+                    return ExtType(n, bytes(obj))
+                if decision != EXT_ALLOW:
+                    raise ValueError("ext_policy returned invalid decision %r" % (decision,))
             if n == -1:  # timestamp
                 ts = Timestamp.from_bytes(bytes(obj))
                 if self._timestamp == 1:
@@ -581,6 +645,29 @@ class Unpacker:
                 return self._ext_hook(n, bytes(obj))
         assert typ == TYPE_IMMEDIATE
         return obj
+
+    def _unpack_map_key(self):
+        track_path = self._ext_policy is not None
+        if track_path:
+            self._ext_path.append(MAP_KEY)
+        try:
+            key = self._unpack(EX_CONSTRUCT)
+        finally:
+            if track_path:
+                self._ext_path.pop()
+        if self._strict_map_key and type(key) not in (str, bytes):
+            raise ValueError("%s is not allowed for map key" % str(type(key)))
+        return key
+
+    def _unpack_map_value(self, key):
+        track_path = self._ext_policy is not None
+        if track_path:
+            self._ext_path.append(key)
+        try:
+            return self._unpack(EX_CONSTRUCT)
+        finally:
+            if track_path:
+                self._ext_path.pop()
 
     def __iter__(self):
         return self
