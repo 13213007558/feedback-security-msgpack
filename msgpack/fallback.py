@@ -55,6 +55,7 @@ EX_SKIP = 0
 EX_CONSTRUCT = 1
 EX_READ_ARRAY_HEADER = 2
 EX_READ_MAP_HEADER = 3
+EX_BUILD = 4
 
 TYPE_IMMEDIATE = 0
 TYPE_ARRAY = 1
@@ -64,6 +65,29 @@ TYPE_BIN = 4
 TYPE_EXT = 5
 
 DEFAULT_RECURSE_LIMIT = 1024
+
+
+class _DeferredMap:
+    """Skeleton of a not yet fully parsed map.
+
+    Holds (key, value) skeleton pairs so that no user callback runs before
+    the whole map is parsed.  Used only in ``defer_hooks`` mode.
+    """
+
+    __slots__ = ("pairs",)
+
+    def __init__(self, pairs):
+        self.pairs = pairs
+
+
+class _DeferredExt:
+    """Skeleton of a not yet fully parsed ext value."""
+
+    __slots__ = ("code", "data")
+
+    def __init__(self, code, data):
+        self.code = code
+        self.data = data
 
 
 def _check_type_strict(obj, t, type=type, tuple=tuple):
@@ -179,6 +203,24 @@ class Unpacker:
         Unpacker calls it with a list of key-value pairs after unpacking msgpack map.
         (See also simplejson)
 
+    :param bool defer_hooks:
+        If true, user construction callbacks (*object_hook*,
+        *object_pairs_hook*, *list_hook* and *ext_hook*) are deferred until
+        the whole top-level value has been parsed.  Incomplete input never
+        triggers a callback, and ``OutOfData`` retries never re-run one:
+        each node of each complete value is constructed exactly once, inner
+        nodes before their enclosing node, regardless of how the input is
+        fragmented across ``feed()`` calls.
+
+        The value is parsed into a temporary skeleton first; all buffer and
+        length limits (*max_buffer_size*, *max_str_len*, etc.) are enforced
+        during that phase exactly as before.  Once the value is complete it
+        is consumed (``tell()`` advances past it) and only then are the
+        hooks applied.  If a hook raises, the message is considered
+        consumed: the exception propagates, the failed hook is not called
+        again for that message, and the next unpack continues at the
+        following message boundary.  (default: False)
+
     :param str unicode_errors:
         The error handler for decoding unicode. (default: 'strict')
         This option should be used only when you have msgpack data which
@@ -246,6 +288,7 @@ class Unpacker:
         object_hook=None,
         object_pairs_hook=None,
         list_hook=None,
+        defer_hooks=False,
         unicode_errors=None,
         max_buffer_size=100 * 1024 * 1024,
         ext_hook=ExtType,
@@ -307,6 +350,7 @@ class Unpacker:
         self._list_hook = list_hook
         self._object_hook = object_hook
         self._object_pairs_hook = object_pairs_hook
+        self._defer_hooks = bool(defer_hooks)
         self._ext_hook = ext_hook
         self._max_str_len = max_str_len
         self._max_bin_len = max_bin_len
@@ -500,6 +544,17 @@ class Unpacker:
         return typ, n, obj
 
     def _unpack(self, execute=EX_CONSTRUCT):
+        if execute == EX_CONSTRUCT and self._defer_hooks:
+            # Two-phase unpacking: parse the whole value into a skeleton
+            # without calling any user hook.  OutOfData raised here rolls
+            # the buffer back and no callback has run, so retrying after
+            # feed() never repeats a side effect.  Once the value is
+            # complete it is consumed before the hooks run: if a hook
+            # raises, the message stays consumed and the failed hook is
+            # not called again for it.
+            skeleton = self._unpack(EX_BUILD)
+            self._consume()
+            return self._construct(skeleton)
         typ, n, obj = self._read_header()
 
         if execute == EX_READ_ARRAY_HEADER:
@@ -522,7 +577,10 @@ class Unpacker:
                 return
             ret = newlist_hint(min(n, 10000))
             for i in range(n):
-                ret.append(self._unpack(EX_CONSTRUCT))
+                ret.append(self._unpack(EX_BUILD if execute == EX_BUILD else EX_CONSTRUCT))
+            if execute == EX_BUILD:
+                # Skeleton list; hooks are applied later by _construct().
+                return ret
             if self._list_hook is not None:
                 ret = self._list_hook(ret)
             # TODO is the interaction between `list_hook` and `use_list` ok?
@@ -534,6 +592,14 @@ class Unpacker:
                     self._unpack(EX_SKIP)
                     self._unpack(EX_SKIP)
                 return
+            if execute == EX_BUILD:
+                # Skeleton pairs; hooks and map-key checks are applied
+                # later by _construct().
+                pairs = []
+                for _ in range(n):
+                    key = self._unpack(EX_BUILD)
+                    pairs.append((key, self._unpack(EX_BUILD)))
+                return _DeferredMap(pairs)
             if self._object_pairs_hook is not None:
                 # Pass a list, as the C extension does, so the whole map is
                 # consumed even if the hook does not iterate it.
@@ -578,9 +644,49 @@ class Unpacker:
                 else:
                     return ts
             else:
+                if execute == EX_BUILD:
+                    return _DeferredExt(n, bytes(obj))
                 return self._ext_hook(n, bytes(obj))
         assert typ == TYPE_IMMEDIATE
         return obj
+
+    def _construct(self, skeleton):
+        """Apply deferred hooks to a fully parsed skeleton, inner nodes first.
+
+        Each node is constructed exactly once.  This runs only after the
+        whole top-level value has been parsed and consumed, so an exception
+        raised by a hook cannot be retried for this message.
+        """
+        if type(skeleton) is list:
+            ret = newlist_hint(len(skeleton))
+            for item in skeleton:
+                ret.append(self._construct(item))
+            if self._list_hook is not None:
+                ret = self._list_hook(ret)
+            return ret if self._use_list else tuple(ret)
+        if type(skeleton) is _DeferredMap:
+            if self._object_pairs_hook is not None:
+                pairs = []
+                for key_skeleton, value_skeleton in skeleton.pairs:
+                    key = self._construct(key_skeleton)
+                    if self._strict_map_key and type(key) not in (str, bytes):
+                        raise ValueError("%s is not allowed for map key" % str(type(key)))
+                    pairs.append((key, self._construct(value_skeleton)))
+                return self._object_pairs_hook(pairs)
+            ret = {}
+            for key_skeleton, value_skeleton in skeleton.pairs:
+                key = self._construct(key_skeleton)
+                if self._strict_map_key and type(key) not in (str, bytes):
+                    raise ValueError("%s is not allowed for map key" % str(type(key)))
+                if isinstance(key, str):
+                    key = sys.intern(key)
+                ret[key] = self._construct(value_skeleton)
+            if self._object_hook is not None:
+                ret = self._object_hook(ret)
+            return ret
+        if type(skeleton) is _DeferredExt:
+            return self._ext_hook(skeleton.code, skeleton.data)
+        return skeleton
 
     def __iter__(self):
         return self

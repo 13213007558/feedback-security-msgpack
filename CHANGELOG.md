@@ -1,3 +1,14 @@
+# Unreleased
+
+- Add `defer_hooks` option to the pure Python `Unpacker`. When enabled,
+  `object_hook`, `object_pairs_hook`, `list_hook` and `ext_hook` are deferred
+  until the whole top-level value is parsed, so incomplete input never
+  triggers a callback and `OutOfData` retries never repeat one: each node of
+  each complete value is constructed exactly once, inner nodes first. If a
+  hook raises, the message is considered consumed and unpacking continues at
+  the next message boundary.
+
+
 # 1.2.4
 
 Release Date: 2026-10-27
